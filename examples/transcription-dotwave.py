@@ -29,6 +29,10 @@ from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.turns.user_start import VADUserTurnStartStrategy
+from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+from pipecat.turns.user_turn_processor import UserTurnProcessor
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
 from pipecat_dotwave import WaveSTTService
@@ -72,7 +76,20 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # The pipeline worker adds Pipecat's RTVI processor and observer by default.
     # They turn transcription frames into RTVI messages, which reach the
     # browser page through transport.output().
-    pipeline = Pipeline([transport.input(), vad, stt, TranscriptionLogger(), transport.output()])
+    # Turn frames tell the browser page when a turn ends, so each turn shows as
+    # its own entry. A turn starts when the VAD hears speech and ends after
+    # 0.8 s without it; a conversational pipeline would use the LLM user
+    # aggregator's turn handling instead.
+    turns = UserTurnProcessor(
+        user_turn_strategies=UserTurnStrategies(
+            start=[VADUserTurnStartStrategy()],
+            stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.8)],
+        )
+    )
+
+    pipeline = Pipeline(
+        [transport.input(), vad, stt, turns, TranscriptionLogger(), transport.output()]
+    )
 
     worker = PipelineWorker(pipeline, idle_timeout_secs=runner_args.pipeline_idle_timeout_secs)
 
