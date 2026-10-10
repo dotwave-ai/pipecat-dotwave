@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipecat-dotwave"
+version = "0.1.0"
+description = ".wave streaming speech-to-text service for Pipecat"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "BSD-2-Clause"
+license-files = ["LICENSE"]
+authors = [{ name = ".wave", email = "info@dotwave.ai" }]
+keywords = ["pipecat", "speech-to-text", "stt", "asr", "voice", "dotwave"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "pipecat-ai>=1.12.0",
+    "websockets>=13",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+]
+
+[project.urls]
+Homepage = "https://dotwave.ai"
+Documentation = "https://dotwave.ai/docs/deepgram/"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipecat_dotwave"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["D", "E", "F", "I", "UP"]
+ignore = ["D105"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+"examples/**" = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
