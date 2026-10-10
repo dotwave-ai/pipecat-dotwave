@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pipecat-dotwave"
-version = "0.1.0"
+version = "0.1.1"
 description = ".wave streaming speech-to-text service for Pipecat"
 readme = "README.md"
 requires-python = ">=3.11"

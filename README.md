@@ -54,12 +54,36 @@ pipeline = Pipeline(
 
 Put a VAD upstream of the service (a `VADProcessor`, or the user aggregator's
 VAD in an agent pipeline). When the VAD reports the end of speech, the service
-sends `Finalize`, and the final that answers it is pushed as a finalized
+sends `Finalize`, and the segment it closes is pushed as a finalized
 `TranscriptionFrame`.
 
-Each final carries the whole words since the previous final, so successive
-`TranscriptionFrame` texts join with one space, which is what Pipecat's user
-aggregator does. Each interim replaces the previous one.
+### How results arrive
+
+The socket sends a final result as soon as words are settled, often one word
+at a time. The service collects those finals and pushes **one
+`TranscriptionFrame` per segment**, holding the whole text of the segment. A
+segment ends when:
+
+- the socket answers `Finalize`, which the service sends when the VAD reports
+  the end of speech. This frame is marked `finalized`;
+- a final is marked `speech_final`, or an `UtteranceEnd` message arrives (with
+  `utterance_end_ms` set);
+- the service stops, is cancelled or reconnects with words pending, so nothing
+  is lost.
+
+While a segment is open, each interim result and each final pushes an
+`InterimTranscriptionFrame` with the segment so far (settled words plus the
+current guess), so turn strategies and RTVI clients show live text. Each
+interim replaces the previous one. A final that arrives after a segment ended
+starts the next segment.
+
+Finals join with one space, except in Chinese and Japanese (a language tag
+starting with `zh` or `ja`), where they join with no separator.
+
+Pass `segment_finals=False` to get one frame per result instead: an
+`InterimTranscriptionFrame` for each interim and a `TranscriptionFrame` for
+each final, holding only that result's words. Successive `TranscriptionFrame`
+texts then join with one space, which is what Pipecat's user aggregator does.
 
 ### Constructor parameters
 
@@ -73,6 +97,7 @@ aggregator does. Each interim replaces the previous one.
 | `interim_results` | `bool` | `True` | Receive interim results. |
 | `extra_headers` | `dict[str, str] \| None` | `None` | Extra handshake headers. |
 | `settings` | `WaveSTTService.Settings \| None` | `None` | Runtime-updatable settings (below). |
+| `segment_finals` | `bool` | `True` | Push one `TranscriptionFrame` per segment, with interims carrying the segment so far. `False` pushes one frame per result (see [How results arrive](#how-results-arrive)). |
 | `ttfs_p99_latency` | `float \| None` | `None` | P99 speech-end-to-final latency, in seconds, used by turn strategies. .wave has not measured it for Pipecat, so Pipecat's default applies; measure your deployment with [stt-benchmark](https://github.com/pipecat-ai/stt-benchmark) and pass the result. |
 
 ### Settings
@@ -133,8 +158,8 @@ async def on_connected(service):
 
 ## Running the example
 
-[`examples/transcription-dotwave.py`](examples/transcription-dotwave.py) prints
-what you say into your browser's microphone:
+[`examples/transcription-dotwave.py`](examples/transcription-dotwave.py)
+transcribes what you say into your browser's microphone:
 
 ```bash
 git clone https://github.com/dotwave-ai/pipecat-dotwave
@@ -145,7 +170,9 @@ export DOTWAVE_API_KEY=...
 uv run examples/transcription-dotwave.py
 ```
 
-Open http://localhost:7860, connect, and talk.
+Open http://localhost:7860, connect, and talk. Your words appear on the page
+(the pipeline worker's RTVI support sends them through `transport.output()`)
+and in the terminal, one `Transcription:` line per segment.
 
 ## Pricing
 

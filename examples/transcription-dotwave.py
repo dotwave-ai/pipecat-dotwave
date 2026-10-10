@@ -6,8 +6,9 @@
 
 """Transcribe your microphone with .wave in a Pipecat pipeline.
 
-Run it, open http://localhost:7860 in a browser, connect and talk: interim
-results and finals are printed in the terminal.
+Run it, open http://localhost:7860 in a browser, connect and talk. What you
+say appears on the page and in the terminal, one line per sentence or pause;
+interim results are logged at debug level.
 
     export DOTWAVE_API_KEY=...
     uv run examples/transcription-dotwave.py
@@ -18,6 +19,7 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import Frame, InterimTranscriptionFrame, TranscriptionFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineWorker
@@ -35,7 +37,7 @@ load_dotenv(override=True)
 
 
 class TranscriptionLogger(FrameProcessor):
-    """Prints interim results and finals as they arrive."""
+    """Prints each final transcription; interim results go to the debug log."""
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -58,14 +60,19 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info("Starting transcription with .wave")
 
     # The VAD tells the service when speech ends, so it can ask for the final.
-    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer())
+    # Half a second of silence ends a segment, so short pauses do not split a
+    # sentence.
+    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.5)))
 
     stt = WaveSTTService(
         api_key=os.getenv("DOTWAVE_API_KEY"),
         settings=WaveSTTService.Settings(language=Language.EN_US),
     )
 
-    pipeline = Pipeline([transport.input(), vad, stt, TranscriptionLogger()])
+    # The pipeline worker adds Pipecat's RTVI processor and observer by default.
+    # They turn transcription frames into RTVI messages, which reach the
+    # browser page through transport.output().
+    pipeline = Pipeline([transport.input(), vad, stt, TranscriptionLogger(), transport.output()])
 
     worker = PipelineWorker(pipeline, idle_timeout_secs=runner_args.pipeline_idle_timeout_secs)
 

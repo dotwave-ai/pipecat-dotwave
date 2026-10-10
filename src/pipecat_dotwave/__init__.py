@@ -13,4 +13,4 @@ Provides :class:`WaveSTTService`, a streaming STT service for the .wave
 from pipecat_dotwave.stt import WaveSTTService, WaveSTTSettings
 
 __all__ = ["WaveSTTService", "WaveSTTSettings"]
-__version__ = "0.1.0"
+__version__ = "0.1.1"

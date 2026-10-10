@@ -5,6 +5,17 @@ All notable changes to **pipecat-dotwave** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-10-10
+
+### Changed
+
+- One `TranscriptionFrame` per segment by default (`segment_finals`), and
+  interims carry the segment so far. A segment ends when the socket answers
+  `Finalize`, on a `speech_final` final, on `UtteranceEnd`, or when the service
+  stops or reconnects. `segment_finals=False` keeps one frame per result.
+- The example shows transcripts in the browser page via RTVI, and its VAD stop
+  time is 0.5 s.
+
 ## [0.1.0] - 2026-10-10
 
 ### Added

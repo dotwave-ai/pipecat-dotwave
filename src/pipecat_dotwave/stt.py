@@ -81,6 +81,10 @@ _UNSUPPORTED_OPTIONS: dict[str, str] = {
     ),
 }
 
+# Languages written without spaces between words. The socket's words there are
+# single characters, so the finals of a segment join with no separator.
+_UNSPACED_LANGUAGE_PREFIXES = ("zh", "ja")
+
 # Bare language codes mapped to the regional tag the socket serves for them.
 # Tags already in this form (Language.PT_BR, "de-DE", ...) pass through as is,
 # and "en" and "multi" are accepted by the socket directly.
@@ -175,15 +179,33 @@ class WaveSTTService(WebsocketSTTService):
     """Speech-to-text service using the .wave streaming transcription socket.
 
     Streams pipeline audio to ``wss://api.dotwave.ai/v1/listen``, a
-    Deepgram-compatible socket, and pushes an ``InterimTranscriptionFrame`` for
-    each interim result and a ``TranscriptionFrame`` for each final one. Every
-    final carries the whole words since the previous final, so successive
-    ``TranscriptionFrame`` objects join with one space, which is what Pipecat's
-    user aggregator does.
+    Deepgram-compatible socket, and turns its results into transcription
+    frames.
 
-    When the VAD reports the end of speech (``VADUserStoppedSpeakingFrame``)
-    the service sends ``Finalize``; the socket answers with a final marked
-    ``from_finalize``, and that transcription is pushed as finalized.
+    The socket sends a final ``Results`` message as soon as words are settled,
+    often one word at a time. By default (``segment_finals=True``) the service
+    collects those finals and pushes one ``TranscriptionFrame`` per segment,
+    with the whole text of the segment. A segment ends when:
+
+    - the socket answers ``Finalize`` (a final marked ``from_finalize``). The
+      service sends ``Finalize`` when the VAD reports the end of speech
+      (``VADUserStoppedSpeakingFrame``), and this frame is marked finalized;
+    - a final is marked ``speech_final``, or an ``UtteranceEnd`` message
+      arrives (with ``utterance_end_ms`` set);
+    - the service stops, is cancelled or reconnects with words pending.
+
+    While a segment is open, every interim result and every final pushes an
+    ``InterimTranscriptionFrame`` carrying the segment so far, so turn
+    strategies and clients see live text. A final that arrives after a segment
+    ended starts the next segment.
+
+    The finals of a segment join with one space, except in Chinese and
+    Japanese (a segment language starting with ``zh`` or ``ja``), where they
+    join with no separator.
+
+    With ``segment_finals=False`` the service pushes one frame per ``Results``
+    message instead: an ``InterimTranscriptionFrame`` for each interim and a
+    ``TranscriptionFrame`` for each final, holding only that message's words.
 
     The socket closes a session after 30 seconds without audio, so the
     service sends a short burst of silence after 20 idle seconds.
@@ -218,6 +240,7 @@ class WaveSTTService(WebsocketSTTService):
         extra_headers: dict[str, str] | None = None,
         settings: Settings | None = None,
         ttfs_p99_latency: float | None = None,
+        segment_finals: bool = True,
         **kwargs,
     ):
         """Initialize the .wave STT service.
@@ -247,6 +270,13 @@ class WaveSTTService(WebsocketSTTService):
                 seconds. .wave has not measured this value for Pipecat; if None,
                 Pipecat's default applies. Measure your deployment with
                 https://github.com/pipecat-ai/stt-benchmark and pass the result.
+            segment_finals: Whether to push one ``TranscriptionFrame`` per
+                segment (True, the default), joining the finals the socket sends
+                until ``Finalize`` is answered, a ``speech_final`` final or an
+                ``UtteranceEnd`` message; interim frames then carry the segment
+                so far. If False, every final ``Results`` message is pushed as
+                its own ``TranscriptionFrame`` and every interim as its own
+                ``InterimTranscriptionFrame``.
             **kwargs: Additional arguments passed to ``WebsocketSTTService``.
 
         Raises:
@@ -301,6 +331,13 @@ class WaveSTTService(WebsocketSTTService):
         self._wire_sample_rate = 0
         self._resampler = create_stream_resampler()
         self._request_id: str | None = None
+
+        # Segment-level finals: the finals since the last segment boundary, the
+        # language reported for the segment and the last final of the segment.
+        self._segment_finals = segment_finals
+        self._segment: list[str] = []
+        self._segment_language: str | None = None
+        self._segment_result: dict[str, Any] | None = None
 
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate processing metrics.
@@ -504,6 +541,9 @@ class WaveSTTService(WebsocketSTTService):
             await self.push_error(error_msg=f"Unable to connect to .wave: {e}", exception=e)
 
     async def _disconnect_websocket(self):
+        # Push the words of an unfinished segment before the session ends, on
+        # stop, cancel and reconnect alike, so none is lost.
+        await self._flush_segment()
         ws = self._websocket
         try:
             if ws and ws.state is State.OPEN:
@@ -565,6 +605,8 @@ class WaveSTTService(WebsocketSTTService):
             logger.trace(f"{self}: speech started at {data.get('timestamp')}")
         elif message_type == "UtteranceEnd":
             logger.trace(f"{self}: utterance ended at {data.get('last_word_end')}")
+            if self._segment_finals:
+                await self._end_segment(data)
         elif message_type == "Error":
             error_msg = data.get("message") or data.get("description") or "Unknown error"
             parameter = data.get("parameter")
@@ -586,7 +628,112 @@ class WaveSTTService(WebsocketSTTService):
         alternative = alternatives[0]
         transcript = alternative.get("transcript") or ""
         languages = alternative.get("languages") or []
-        language = dotwave_language_to_language(languages[0] if languages else None)
+        tag = languages[0] if languages else None
+
+        if not self._segment_finals:
+            await self._on_results_per_message(data, transcript, tag)
+            return
+
+        if tag:
+            self._segment_language = tag
+
+        if not data.get("is_final"):
+            if transcript:
+                await self._push_interim([*self._segment, transcript], data)
+            return
+
+        if transcript:
+            self._segment.append(transcript)
+            self._segment_result = data
+
+        from_finalize = bool(data.get("from_finalize"))
+        if from_finalize or data.get("speech_final"):
+            await self._end_segment(data, from_finalize=from_finalize)
+        elif transcript:
+            # Not a boundary: show the segment so far, and wait for the end of
+            # the segment to push the TranscriptionFrame.
+            await self._push_interim(self._segment, data)
+
+    def _join(self, parts: list[str]) -> str:
+        """Join transcripts of one segment as the segment's language writes them.
+
+        Args:
+            parts: Transcripts in arrival order.
+
+        Returns:
+            The joined text.
+        """
+        # Results carry no language with automatic detection; the configured
+        # language then decides.
+        tag = str(self._segment_language or self._settings.language or "").lower()
+        separator = "" if tag.startswith(_UNSPACED_LANGUAGE_PREFIXES) else " "
+        return separator.join(part.strip() for part in parts if part.strip())
+
+    async def _push_interim(self, parts: list[str], result: dict[str, Any]):
+        text = self._join(parts)
+        if not text:
+            return
+        await self.push_frame(
+            InterimTranscriptionFrame(
+                text,
+                self._user_id,
+                time_now_iso8601(),
+                dotwave_language_to_language(self._segment_language),
+                result=result,
+            )
+        )
+
+    async def _end_segment(self, result: dict[str, Any] | None, *, from_finalize: bool = False):
+        """Push the open segment as one TranscriptionFrame and start a new one.
+
+        Args:
+            result: The message that ended the segment, set as the frame's
+                ``result``.
+            from_finalize: Whether the segment ended on the answer to Finalize.
+        """
+        text = self._join(self._segment)
+        language = dotwave_language_to_language(self._segment_language)
+        # Reset before pushing, so a message handled meanwhile starts the next
+        # segment instead of joining this one.
+        self._segment = []
+        self._segment_language = None
+        self._segment_result = None
+
+        if not text:
+            if from_finalize:
+                # The words already went out in earlier segments, so the empty
+                # answer to Finalize closes the measurement now instead of
+                # waiting for the timeout.
+                await self.stop_ttfb_metrics()
+                await self._cancel_ttfb_timeout()
+            return
+
+        # Only mark as finalized when a finalize was requested and the socket
+        # confirms it.
+        if from_finalize:
+            self.confirm_finalize()
+        # Report usage before the transcription frame so tracing can attach it
+        # to the STT span the frame closes.
+        await self.emit_stt_usage_metrics()
+        await self.push_frame(
+            TranscriptionFrame(
+                text,
+                self._user_id,
+                time_now_iso8601(),
+                language,
+                result=result,
+            )
+        )
+        await self._handle_transcription(text, True, language)
+
+    async def _flush_segment(self):
+        """Push an unfinished segment, if any, as a TranscriptionFrame."""
+        if self._segment_finals and self._segment:
+            await self._end_segment(self._segment_result)
+
+    async def _on_results_per_message(self, data: dict[str, Any], transcript: str, tag: str | None):
+        """Push one frame per Results message (``segment_finals=False``)."""
+        language = dotwave_language_to_language(tag)
         is_final = bool(data.get("is_final"))
 
         if is_final:

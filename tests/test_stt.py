@@ -35,6 +35,7 @@ def _results(
     transcript: str,
     *,
     is_final: bool,
+    speech_final: bool = False,
     from_finalize: bool = False,
     language: str | None = "en-US",
 ) -> str:
@@ -48,7 +49,7 @@ def _results(
             "start": 0.16,
             "duration": 0.08,
             "is_final": is_final,
-            "speech_final": False,
+            "speech_final": speech_final,
             "from_finalize": from_finalize,
             "metadata": {
                 "request_id": "sess_test",
@@ -69,13 +70,18 @@ class FakeListenServer:
     """A minimal stand-in for the /v1/listen socket.
 
     On the first audio message it sends SpeechStarted, an interim and a final
-    ("hello"); on the second an interim ("world"); it answers each Finalize
-    with a from_finalize final, carrying the pending interim the first time
-    and nothing after that.
+    ("Hello"); on the second an interim ("wor") and a final ("world."); it
+    answers each Finalize with an empty from_finalize final, as the socket does
+    when every word already went out in a final.
+
+    A test can replace what follows the first audio message with ``script``,
+    and the answer to Finalize with ``finalize_reply``.
     """
 
     language: str | None = "en-US"
     reject_with: int | None = None
+    script: list[str] | None = None
+    finalize_reply: str | None = None
     connections: list[dict] = field(default_factory=list)
     text_messages: list[dict] = field(default_factory=list)
     audio_bytes: int = 0
@@ -99,28 +105,30 @@ class FakeListenServer:
             json.dumps({"type": "Metadata", "request_id": "sess_test", "channels": 1})
         )
         audio_messages = 0
-        finalizes = 0
         async for message in connection:
             if isinstance(message, bytes):
                 audio_messages += 1
                 self.audio_bytes += len(message)
-                if audio_messages == 1:
+                if audio_messages == 1 and self.script is not None:
+                    for scripted in self.script:
+                        await connection.send(scripted)
+                elif audio_messages == 1:
                     await connection.send(
                         json.dumps({"type": "SpeechStarted", "channel": [0], "timestamp": 0.0})
                     )
                     await connection.send(_results("hel", is_final=False, language=self.language))
                     await connection.send(_results("Hello", is_final=True, language=self.language))
-                elif audio_messages == 2:
+                elif audio_messages == 2 and self.script is None:
                     await connection.send(_results("wor", is_final=False, language=self.language))
+                    await connection.send(_results("world.", is_final=True, language=self.language))
                 continue
             data = json.loads(message)
             self.text_messages.append(data)
             if data["type"] == "Finalize":
-                finalizes += 1
-                text = "world." if finalizes == 1 else ""
-                await connection.send(
-                    _results(text, is_final=True, from_finalize=True, language=self.language)
+                reply = self.finalize_reply or _results(
+                    "", is_final=True, from_finalize=True, language=self.language
                 )
+                await connection.send(reply)
             elif data["type"] == "CloseStream":
                 await connection.close(1000)
                 return
@@ -164,20 +172,19 @@ async def test_streams_audio_and_maps_results(fake_server):
     )
 
     frames = _transcriptions(down)
+    # Interims carry the segment so far; the segment is pushed once, when the
+    # socket answers Finalize, and marked finalized.
     assert [(type(f), f.text) for f in frames] == [
         (InterimTranscriptionFrame, "hel"),
-        (TranscriptionFrame, "Hello"),
-        (InterimTranscriptionFrame, "wor"),
-        (TranscriptionFrame, "world."),
+        (InterimTranscriptionFrame, "Hello"),
+        (InterimTranscriptionFrame, "Hello wor"),
+        (InterimTranscriptionFrame, "Hello world."),
+        (TranscriptionFrame, "Hello world."),
     ]
     assert all(f.language == Language.EN_US for f in frames)
-    # Only the final that answers Finalize is marked finalized.
-    finals = [f for f in frames if isinstance(f, TranscriptionFrame)]
-    assert [f.finalized for f in finals] == [False, True]
-    assert finals[0].result["type"] == "Results"
-
-    # Successive finals join with one space, as the user aggregator joins them.
-    assert " ".join(f.text for f in finals) == "Hello world."
+    (final,) = [f for f in frames if isinstance(f, TranscriptionFrame)]
+    assert final.finalized
+    assert final.result["from_finalize"] is True
 
     (connection,) = fake_server.connections
     assert connection["path"] == "/v1/listen"
@@ -227,7 +234,8 @@ async def test_automatic_language_detection_omits_language(fake_server):
     (connection,) = fake_server.connections
     assert "language" not in connection["query"]
     frames = _transcriptions(down)
-    assert [f.text for f in frames] == ["hel", "Hello"]
+    # The open segment is pushed when the pipeline ends.
+    assert [f.text for f in frames] == ["hel", "Hello", "Hello"]
     assert all(f.language is None for f in frames)
 
 
@@ -237,7 +245,7 @@ async def test_unknown_result_language_does_not_raise(fake_server):
     down, _ = await run_test(stt, frames_to_send=[_audio(), SleepFrame(sleep=0.3)])
 
     frames = _transcriptions(down)
-    assert [f.text for f in frames] == ["hel", "Hello"]
+    assert [f.text for f in frames] == ["hel", "Hello", "Hello"]
     assert all(f.language is None for f in frames)
 
 
@@ -282,6 +290,145 @@ async def test_bad_credential_is_reported_and_not_retried(fake_server):
     assert not stt.is_usable
     # One attempt only: a refused credential is not retried.
     assert len(fake_server.connections) == 1
+
+
+def _segment_frames(frames):
+    return [(type(f).__name__, f.text) for f in _transcriptions(frames)]
+
+
+async def test_speech_final_ends_segment_without_finalize(fake_server):
+    fake_server.script = [
+        _results("Good", is_final=True),
+        _results("morning.", is_final=True, speech_final=True),
+        _results("Bye", is_final=True),
+    ]
+    stt = WaveSTTService(api_key=API_KEY, base_url=fake_server.base_url)
+    down, _ = await run_test(stt, frames_to_send=[_audio(), SleepFrame(sleep=0.3)])
+
+    assert _segment_frames(down) == [
+        ("InterimTranscriptionFrame", "Good"),
+        ("TranscriptionFrame", "Good morning."),
+        # A final after the boundary starts the next segment, pushed at the end.
+        ("InterimTranscriptionFrame", "Bye"),
+        ("TranscriptionFrame", "Bye"),
+    ]
+    finals = [f for f in down if isinstance(f, TranscriptionFrame)]
+    assert [f.finalized for f in finals] == [False, False]
+    assert finals[0].result["speech_final"] is True
+    assert finals[0].language == Language.EN_US
+
+
+async def test_utterance_end_ends_segment(fake_server):
+    utterance_end = json.dumps({"type": "UtteranceEnd", "channel": [0, 1], "last_word_end": 1.2})
+    fake_server.script = [
+        _results("Hi", is_final=True),
+        _results("there", is_final=False),
+        _results("there", is_final=True),
+        utterance_end,
+        # A second boundary with nothing pending pushes nothing.
+        utterance_end,
+    ]
+    stt = WaveSTTService(api_key=API_KEY, base_url=fake_server.base_url, utterance_end_ms=1000)
+    down, _ = await run_test(stt, frames_to_send=[_audio(), SleepFrame(sleep=0.3)])
+
+    assert _segment_frames(down) == [
+        ("InterimTranscriptionFrame", "Hi"),
+        ("InterimTranscriptionFrame", "Hi there"),
+        ("InterimTranscriptionFrame", "Hi there"),
+        ("TranscriptionFrame", "Hi there"),
+    ]
+    (final,) = [f for f in down if isinstance(f, TranscriptionFrame)]
+    assert final.result["type"] == "UtteranceEnd"
+    assert not final.finalized
+
+
+async def test_finalize_answer_carries_its_own_word(fake_server):
+    fake_server.script = [_results("Thank", is_final=True)]
+    fake_server.finalize_reply = _results("you.", is_final=True, from_finalize=True)
+    stt = WaveSTTService(api_key=API_KEY, base_url=fake_server.base_url)
+    down, _ = await run_test(
+        stt,
+        frames_to_send=[
+            VADUserStartedSpeakingFrame(),
+            _audio(),
+            SleepFrame(sleep=0.2),
+            VADUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=0.3),
+        ],
+    )
+
+    assert _segment_frames(down) == [
+        ("InterimTranscriptionFrame", "Thank"),
+        ("TranscriptionFrame", "Thank you."),
+    ]
+    (final,) = [f for f in down if isinstance(f, TranscriptionFrame)]
+    assert final.finalized
+
+
+async def test_chinese_segment_joins_without_spaces(fake_server):
+    fake_server.language = "zh-CN"
+    fake_server.script = [
+        _results("你", is_final=True, language="zh-CN"),
+        _results("好", is_final=True, language="zh-CN"),
+        _results("世", is_final=False, language="zh-CN"),
+        _results("世", is_final=True, speech_final=True, language="zh-CN"),
+    ]
+    stt = WaveSTTService(
+        api_key=API_KEY,
+        base_url=fake_server.base_url,
+        settings=WaveSTTService.Settings(language=Language.ZH),
+    )
+    down, _ = await run_test(stt, frames_to_send=[_audio(), SleepFrame(sleep=0.3)])
+
+    assert _segment_frames(down) == [
+        ("InterimTranscriptionFrame", "你"),
+        ("InterimTranscriptionFrame", "你好"),
+        ("InterimTranscriptionFrame", "你好世"),
+        ("TranscriptionFrame", "你好世"),
+    ]
+    assert all(f.language == Language.ZH_CN for f in _transcriptions(down))
+
+
+async def test_per_message_frames_when_segment_finals_off(fake_server):
+    stt = WaveSTTService(api_key=API_KEY, base_url=fake_server.base_url, segment_finals=False)
+    down, _ = await run_test(
+        stt,
+        frames_to_send=[
+            VADUserStartedSpeakingFrame(),
+            _audio(),
+            SleepFrame(sleep=0.2),
+            _audio(),
+            SleepFrame(sleep=0.2),
+            VADUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=0.3),
+        ],
+    )
+
+    assert _segment_frames(down) == [
+        ("InterimTranscriptionFrame", "hel"),
+        ("TranscriptionFrame", "Hello"),
+        ("InterimTranscriptionFrame", "wor"),
+        ("TranscriptionFrame", "world."),
+    ]
+    finals = [f for f in down if isinstance(f, TranscriptionFrame)]
+    # The empty answer to Finalize pushes nothing, so no final is finalized.
+    assert [f.finalized for f in finals] == [False, False]
+
+
+async def test_pending_segment_is_pushed_on_end_frame(fake_server):
+    # No boundary arrives: the run ends with an EndFrame while words are pending.
+    fake_server.script = [_results("Still", is_final=True), _results("talking", is_final=True)]
+    stt = WaveSTTService(api_key=API_KEY, base_url=fake_server.base_url)
+    down, _ = await run_test(stt, frames_to_send=[_audio(), SleepFrame(sleep=0.3)])
+
+    assert _segment_frames(down) == [
+        ("InterimTranscriptionFrame", "Still"),
+        ("InterimTranscriptionFrame", "Still talking"),
+        ("TranscriptionFrame", "Still talking"),
+    ]
+    (final,) = [f for f in down if isinstance(f, TranscriptionFrame)]
+    assert not final.finalized
+    assert final.result["channel"]["alternatives"][0]["transcript"] == "talking"
 
 
 def test_language_mapping():
