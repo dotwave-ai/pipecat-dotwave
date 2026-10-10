@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv venv --python ${{ matrix.python-version }}
+      - run: uv pip install -e . pytest pytest-asyncio ruff
+      - run: uv run --no-project ruff check .
+      - run: uv run --no-project ruff format --check .
+      - run: uv run --no-project pytest -q

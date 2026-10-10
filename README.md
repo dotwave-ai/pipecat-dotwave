@@ -180,3 +180,10 @@ BSD 2-Clause. See [LICENSE](LICENSE).
 
 Built and maintained by .wave ([dotwave.ai](https://dotwave.ai)). Questions:
 info@dotwave.ai.
+
+## Releasing
+
+Tag a version (`git tag v0.1.0 && git push --tags`). The `publish.yml`
+workflow builds the wheel and sdist with `uv build` and uploads them to PyPI
+through a trusted publisher configured for this repository. Without Actions,
+`uv build && uv publish` does the same from a machine with a PyPI token.
