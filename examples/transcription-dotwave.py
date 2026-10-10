@@ -79,10 +79,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # Turn frames tell the browser page when a turn ends, so each turn shows as
     # its own entry. A turn starts when the VAD hears speech and ends after
     # 0.8 s without it; a conversational pipeline would use the LLM user
-    # aggregator's turn handling instead.
+    # aggregator's turn handling instead. Interruptions stay off: there is no
+    # bot to interrupt, and an interruption discards the frames queued at every
+    # processor, which would drop a transcription still on its way to the page
+    # when the speaker starts the next turn.
     turns = UserTurnProcessor(
         user_turn_strategies=UserTurnStrategies(
-            start=[VADUserTurnStartStrategy()],
+            start=[VADUserTurnStartStrategy(enable_interruptions=False)],
             stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.8)],
         )
     )
