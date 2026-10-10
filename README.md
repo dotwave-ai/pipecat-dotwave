@@ -33,14 +33,13 @@ export DOTWAVE_API_KEY=...
 ```python
 import os
 
-from pipecat.transcriptions.language import Language
-
 from pipecat_dotwave import WaveSTTService
 
-stt = WaveSTTService(
-    api_key=os.getenv("DOTWAVE_API_KEY"),
-    settings=WaveSTTService.Settings(language=Language.EN_US),
-)
+# No language set: .wave detects the language being spoken. Pin one when you
+# know it, which is more accurate, with
+# settings=WaveSTTService.Settings(language="fr-FR") or a Pipecat Language.
+# A session pinned to the wrong language drops most of what is said.
+stt = WaveSTTService(api_key=os.getenv("DOTWAVE_API_KEY"))
 
 pipeline = Pipeline(
     [

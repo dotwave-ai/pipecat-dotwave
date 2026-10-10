@@ -27,7 +27,6 @@ from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.turns.user_start import VADUserTurnStartStrategy
 from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
@@ -68,10 +67,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # sentence.
     vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.5)))
 
-    stt = WaveSTTService(
-        api_key=os.getenv("DOTWAVE_API_KEY"),
-        settings=WaveSTTService.Settings(language=Language.EN_US),
-    )
+    # No language set: .wave detects the language being spoken. Pin one when
+    # you know it, which is more accurate: settings=WaveSTTService.Settings(
+    # language="fr-FR"). A session pinned to the wrong language drops
+    # most of what is said.
+    stt = WaveSTTService(api_key=os.getenv("DOTWAVE_API_KEY"))
 
     # The pipeline worker adds Pipecat's RTVI processor and observer by default.
     # They turn transcription frames into RTVI messages, which reach the
